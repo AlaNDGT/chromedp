@@ -2,6 +2,7 @@ package chromedp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -60,6 +61,8 @@ type TargetHandler struct {
 	logf, debugf, errf func(string, ...interface{})
 
 	sync.RWMutex
+
+	evtSubs sync.Map
 }
 
 // NewTargetHandler creates a new handler for the specified client target.
@@ -536,6 +539,10 @@ func (h *TargetHandler) pageEvent(ctxt context.Context, ev interface{}) {
 	case *page.EventFrameClearedScheduledNavigation:
 		id, op = e.FrameID, frameClearedScheduledNavigation
 
+	case *page.EventScreencastFrame:
+		h.handleScreencastFrameEvent(ctxt, e)
+		return
+
 		// ignored events
 	case *page.EventDomContentEventFired:
 		return
@@ -564,6 +571,43 @@ func (h *TargetHandler) pageEvent(ctxt context.Context, ev interface{}) {
 	defer f.Unlock()
 
 	op(f)
+}
+
+type ScreencastFrameHandler func(data []byte, md *page.ScreencastFrameMetadata)
+
+// SubscribeScreencastFrameEvent subscribes to frame receive event
+func (h *TargetHandler) SubscribeScreencastFrameEvent(fn ScreencastFrameHandler) {
+	var subs []ScreencastFrameHandler
+	if v, ok := h.evtSubs.Load(page.CommandScreencastFrameAck); ok {
+		subs = v.([]ScreencastFrameHandler)
+	}
+	subs = append(subs, fn)
+	h.evtSubs.Store(page.CommandScreencastFrameAck, subs)
+}
+
+func (h *TargetHandler) handleScreencastFrameEvent(ctxt context.Context, ev *page.EventScreencastFrame) {
+	v, ok := h.evtSubs.Load(page.CommandScreencastFrameAck)
+	if !ok || ev.Data == "" {
+		return
+	}
+
+	var data []byte
+	data, err := base64.StdEncoding.DecodeString(ev.Data)
+	if err != nil {
+		h.errf("could not decode screencast frame session %s: %v", ev.SessionID, err)
+		return
+	}
+
+	subs := v.([]ScreencastFrameHandler)
+	for _, sub := range subs {
+		sub(data, ev.Metadata)
+	}
+
+	err = page.ScreencastFrameAck(ev.SessionID).Do(ctxt, h)
+	if err != nil {
+		h.errf("could not ack screencast frame session %s: %v", ev.SessionID, err)
+		println("DEBUG ", err.Error())
+	}
 }
 
 // domEvent handles incoming DOM events.
